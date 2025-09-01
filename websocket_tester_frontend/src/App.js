@@ -8,6 +8,7 @@ import './App.css';
  * - Main panel with connection controls and real-time log/messages
  * - Supports connect/disconnect, send message, copy and clear logs
  * - Modern, minimalistic, light theme using provided color palette
+ * - Enhanced: Auto-reconnect with backoff and visible "Reconnecting" status
  */
 
 // Color palette from request
@@ -45,16 +46,32 @@ export default function App() {
   const [serverUrl, setServerUrl] = useState(savedEndpoints[0] || '');
   const [isConnected, setIsConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
+  const [nextRetryInMs, setNextRetryInMs] = useState(null);
+  const [autoReconnect, setAutoReconnect] = useState(() => {
+    try {
+      const raw = localStorage.getItem('ws_auto_reconnect');
+      return raw ? JSON.parse(raw) : true;
+    } catch {
+      return true;
+    }
+  });
+
   const [messageText, setMessageText] = useState('');
   const [logs, setLogs] = useState([]);
   const [autoScroll, setAutoScroll] = useState(true);
   const [filter, setFilter] = useState('all'); // all | sent | received | status | error
 
   const wsRef = useRef(null);
+  const reconnectTimerRef = useRef(null);
+  const countdownTimerRef = useRef(null);
+  const isManualCloseRef = useRef(false);
+
   const logEndRef = useRef(null);
   const logScrollerRef = useRef(null);
 
-  // Persist endpoints
+  // Persist endpoints and autoReconnect preference
   useEffect(() => {
     try {
       localStorage.setItem('ws_saved_endpoints', JSON.stringify(savedEndpoints));
@@ -62,6 +79,25 @@ export default function App() {
       // ignore storage errors
     }
   }, [savedEndpoints]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('ws_auto_reconnect', JSON.stringify(autoReconnect));
+    } catch {
+      // ignore storage errors
+    }
+  }, [autoReconnect]);
+
+  // Cleanup timers on unmount
+  useEffect(() => {
+    return () => {
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+      if (wsRef.current) {
+        try { wsRef.current.close(); } catch {}
+      }
+    };
+  }, []);
 
   // Autoscroll behavior
   useEffect(() => {
@@ -99,18 +135,69 @@ export default function App() {
     return logs.filter((l) => l.type === filter);
   }, [logs, filter]);
 
-  // PUBLIC_INTERFACE
-  const connect = () => {
+  const clearReconnectTimers = () => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    if (countdownTimerRef.current) {
+      clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+    setNextRetryInMs(null);
+  };
+
+  const scheduleReconnect = () => {
+    if (!autoReconnect) return;
+    // Exponential backoff with jitter: base 1000ms, cap 30000ms
+    const base = 1000;
+    const max = 30000;
+    const attempt = Math.max(1, retryCount + 1);
+    const delay = Math.min(max, base * Math.pow(2, attempt - 1));
+    const jitter = Math.floor(Math.random() * 400); // up to 400ms jitter
+    const nextDelay = delay + jitter;
+
+    setRetryCount(attempt);
+    setReconnecting(true);
+    setConnecting(false);
+    addLog(LOG_TYPES.STATUS, `Reconnecting in ${(nextDelay / 1000).toFixed(1)}s (attempt ${attempt})...`);
+
+    // Update countdown indicator every 200ms
+    setNextRetryInMs(nextDelay);
+    const start = Date.now();
+    if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+    countdownTimerRef.current = setInterval(() => {
+      const elapsed = Date.now() - start;
+      const remaining = Math.max(0, nextDelay - elapsed);
+      setNextRetryInMs(remaining);
+      if (remaining <= 0 && countdownTimerRef.current) {
+        clearInterval(countdownTimerRef.current);
+        countdownTimerRef.current = null;
+      }
+    }, 200);
+
+    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = setTimeout(() => {
+      reconnectTimerRef.current = null;
+      attemptConnect(true);
+    }, nextDelay);
+  };
+
+  const attemptConnect = (isRetry = false) => {
     if (isConnected || connecting || !serverUrl) return;
     try {
       setConnecting(true);
-      addLog(LOG_TYPES.STATUS, `Connecting to ${serverUrl} ...`);
+      setReconnecting(isRetry);
+      addLog(LOG_TYPES.STATUS, `${isRetry ? 'Reconnecting' : 'Connecting'} to ${serverUrl} ...`);
       const ws = new WebSocket(serverUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
         setIsConnected(true);
         setConnecting(false);
+        setReconnecting(false);
+        setRetryCount(0);
+        clearReconnectTimers();
         addLog(LOG_TYPES.STATUS, `Connected to ${serverUrl}`);
       };
 
@@ -125,19 +212,47 @@ export default function App() {
       ws.onclose = (evt) => {
         setIsConnected(false);
         setConnecting(false);
-        addLog(LOG_TYPES.STATUS, `Connection closed${evt?.code ? ` (code: ${evt.code})` : ''}`);
+        const wasManual = isManualCloseRef.current;
+        isManualCloseRef.current = false;
+
+        addLog(
+          LOG_TYPES.STATUS,
+          `Connection closed${evt?.code ? ` (code: ${evt.code})` : ''}${wasManual ? ' (manual)' : ''}`
+        );
+
+        if (!wasManual && autoReconnect) {
+          scheduleReconnect();
+        } else {
+          setReconnecting(false);
+          clearReconnectTimers();
+        }
       };
     } catch (e) {
       setConnecting(false);
+      setReconnecting(false);
       addLog(LOG_TYPES.ERROR, `Failed to connect: ${e.message}`);
+      // If failed immediately and autoReconnect is on, schedule retry
+      if (autoReconnect) {
+        scheduleReconnect();
+      }
     }
   };
 
   // PUBLIC_INTERFACE
+  const connect = () => {
+    isManualCloseRef.current = false;
+    attemptConnect(false);
+  };
+
+  // PUBLIC_INTERFACE
   const disconnect = () => {
+    clearReconnectTimers();
+    setRetryCount(0);
+    setReconnecting(false);
     if (wsRef.current && (isConnected || connecting)) {
       addLog(LOG_TYPES.STATUS, 'Disconnecting...');
       try {
+        isManualCloseRef.current = true;
         wsRef.current.close();
       } catch (e) {
         addLog(LOG_TYPES.ERROR, `Error during disconnect: ${e.message}`);
@@ -195,12 +310,25 @@ export default function App() {
     setSavedEndpoints((prev) => prev.filter((e) => e !== url));
   };
 
+  const effectiveStatus = isConnected
+    ? 'Connected'
+    : reconnecting
+    ? `Reconnecting${nextRetryInMs != null ? ` in ${(nextRetryInMs / 1000).toFixed(1)}s...` : '...'}` 
+    : connecting
+    ? 'Connecting...'
+    : 'Disconnected';
+
+  const statusColor = isConnected
+    ? 'connected'
+    : reconnecting
+    ? 'reconnecting'
+    : connecting
+    ? 'connecting'
+    : 'disconnected';
+
   return (
     <div className="ws-app" data-theme="light">
-      <TopNav
-        status={isConnected ? 'Connected' : connecting ? 'Connecting...' : 'Disconnected'}
-        statusColor={isConnected ? 'connected' : connecting ? 'connecting' : 'disconnected'}
-      />
+      <TopNav status={effectiveStatus} statusColor={statusColor} />
 
       <div className="ws-layout">
         <Sidebar
@@ -216,6 +344,9 @@ export default function App() {
           setServerUrl={setServerUrl}
           isConnected={isConnected}
           isConnecting={connecting}
+          isReconnecting={reconnecting}
+          autoReconnect={autoReconnect}
+          setAutoReconnect={setAutoReconnect}
           onConnect={connect}
           onDisconnect={disconnect}
           messageText={messageText}
@@ -228,6 +359,8 @@ export default function App() {
           setFilter={setFilter}
           onCopy={copyLogs}
           onClear={clearLogs}
+          retryCount={retryCount}
+          nextRetryInMs={nextRetryInMs}
         />
       </div>
     </div>
@@ -290,6 +423,9 @@ function MainPanel({
   setServerUrl,
   isConnected,
   isConnecting,
+  isReconnecting,
+  autoReconnect,
+  setAutoReconnect,
   onConnect,
   onDisconnect,
   messageText,
@@ -302,6 +438,8 @@ function MainPanel({
   setFilter,
   onCopy,
   onClear,
+  retryCount,
+  nextRetryInMs,
 }) {
   return (
     <main className="ws-main">
@@ -332,6 +470,31 @@ function MainPanel({
             </button>
           )}
         </div>
+
+        <div className="field-row">
+          <label className="label" htmlFor="auto-reconnect-toggle">
+            Auto-reconnect
+          </label>
+          <button
+            id="auto-reconnect-toggle"
+            className={`chip ${autoReconnect ? 'chip-active' : ''}`}
+            onClick={() => setAutoReconnect((v) => !v)}
+            aria-pressed={autoReconnect}
+            title="Toggle automatic reconnection"
+          >
+            {autoReconnect ? 'Enabled' : 'Disabled'}
+          </button>
+          <div style={{ minHeight: 40, display: 'flex', alignItems: 'center' }}>
+            {(isReconnecting || isConnecting) && (
+              <span className="muted" aria-live="polite">
+                {isReconnecting
+                  ? `Reconnecting${nextRetryInMs != null ? ` in ${(nextRetryInMs / 1000).toFixed(1)}s` : ''} (attempt ${retryCount})`
+                  : 'Attempting connection...'}
+              </span>
+            )}
+          </div>
+        </div>
+
         <div className="field-row">
           <label htmlFor="ws-message" className="label">
             Message
